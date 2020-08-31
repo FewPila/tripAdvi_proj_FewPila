@@ -1,0 +1,284 @@
+---
+title: "Tripadvisor Scraping"
+output: html_document
+knit: (function(input_file, encoding) {
+  out_dir <- 'Scraping';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+---
+
+```{r}
+library(dplyr)
+library(data.table)
+library(xml2)
+library(rvest)
+library(stringr)
+library(qdapRegex)
+library(tidyr)
+```
+
+link ที่จะเก็บข้อมูลคือ "https://www.tripadvisor.com/ShowForum-g293915-i3686-Thailand.html"
+โดยแต่ละหน้าจะแสดงอยู่ประมาณ 20 กระทู้ โดย pattern การแยกหน้าคือ -o
+เช่น หน้าแรก "https://www.tripadvisor.com/ShowForum-g293915-i3686-Thailand.html"
+    หน้าที่สอง คือ "https://www.tripadvisor.com/ShowForum-g293915-i3686-o20-Thailand.html"
+
+โดยเจ้าของได้เริ่มเก็บข้อมูล ณ วันที่ 12 ส.ค. 62
+
+```{r}
+#สร้างเลข dummy เอาไว้สำหรับการทำ Scraping หลายๆหน้า
+#around 8610 page
+total = 8610*20
+sequence = seq(0,total,20)
+sequence = sequence[-c(8610)] %>% data.table('sequence' = .)
+sequence #172200
+```
+
+สิ่งที่เราเลือกเก็บคือ
+1.link กระทู้หลัก
+2.มาจากกระทู้หลักอะไร
+3.จำนวนการตอบกลับ
+4.ใตรตอบกระทู้ล่าสุด
+
+```{r eval=F}
+all_main_link = data.table()
+for (i in (1:nrow(sequence))){
+  if (i == 1){
+    url = "https://www.tripadvisor.com/ShowForum-g293915-i3686-Thailand.html"
+    link <- read_html(url)%>%html_nodes("b a")%>%html_attrs()%>%data.table('link' = .)
+    from <-read_html(url)%>%html_nodes("tr+ tr .forumcol")%>%html_text()%>%data.table('from' = .)
+    replies <-read_html(url)%>%html_nodes(".reply")%>%html_text()%>%data.table('replies' = .)
+    last_reply <-read_html(url)%>%html_nodes(".rowentry > a")%>%html_text()%>%data.table('last_reply' = .)
+    all = cbind(link,from,replies,last_reply)
+  }else {
+    url = paste0("https://www.tripadvisor.com/ShowForum-g293915-i3686-o",sequence$sequence[i],"-Thailand.html")
+    link <- read_html(url)%>%html_nodes("b a")%>%html_attrs()%>%data.table('link' = .)
+    from <-read_html(url)%>%html_nodes("tr+ tr .forumcol")%>%html_text()%>%data.table('from' = .)
+    replies <-read_html(url)%>%html_nodes(".reply")%>%html_text()%>%data.table('replies' = .)
+    last_reply <-read_html(url)%>%html_nodes(".rowentry > a")%>%html_text()%>%data.table('last_reply' = .)
+    all = cbind(link,from,replies,last_reply)
+  }
+  all_main_link <-rbind(all_main_link,all)
+  rm(link)
+  rm(all)
+  rm(from)
+}
+#clean link 
+all_link <- separate(all_link,link,into = c("link","oneclick"),sep = ",")
+all_link$link =str_extract(all_link$link,"\".*")
+all_link$link =gsub("\"","",all_link$link)
+all_link$oneclick <-NULL
+
+#saveRDS(all_main_link,file = 'all_mainlink.rds')
+```
+
+*******************************************************************************
+```{r}
+all_link <-readRDS("/Users/fewsmc/TEST_git/tripAdvi_proj_FewPila/Scraping/main_link.rds")
+all_link[,] <- lapply(all_link[,],str_squish) # clean \n\t pattern
+all_link[sample(40),] %>% as_tibble()
+
+```
+ทำให้แน่ใจว่าไม่มีกระทู้่ที่ซ้ำ
+```{r}
+all_link <-all_link %>% distinct(link,.keep_all = TRUE) #.kepp_all = T >>> is keep the other columns
+
+```
+
+กระทู้ไหนที่มีการตอบเยอะก็จะมีหลายหน้าซึ่งเหมือนกับตัว link หลักคือแบ่งหน้าของในกระทู้นั้นๆด้วย -o[num]-
+และจะเปลี่ยนเป็น 10 ความคิดเห็นต่อหนึ่งหน้า
+
+https://www.tripadvisor.com/ShowTopic-g293915-i3686-k6601803-Peanut_allergy-Thailand.html #หน้าแรก
+https://www.tripadvisor.com/ShowTopic-g293915-i3686-k6601803-o150-Peanut_allergy-Thailand.html #หน้าประมาณ 16
+
+ซึ่งการเก็บข้อมูลชุด replies มาเพื่อจะได้ทราบว่า กระทู้นั้นมีหน้าย่อยกี่หน้า
+```{r}
+all_link <-all_link[-c(1:6),] #ลบกระทู้ที่โดนปักหมุด
+
+##preprocess for find max_page_per_blog
+all_link$replies <- gsub(',',"",all_link$replies) %>% str_squish() %>%
+  as.numeric(.) #แปลง text ให้เป็น numeric
+all_link <- all_link[!(is.na(all_link$replies)),] #check NA
+all_link %>% as_tibble()
+```
+**********
+```{r}
+#find max page
+max_replies = max(all_link$replies) #4560
+max_page_perblog <-ceiling(all_link$replies/10)
+#dummy สำหรับนำไปใช้กับ nested for loop
+page_dummy <-seq(0,max_replies,10)
+max_page_perblog <- data.table(all_link$replies,max_page_perblog)
+colnames(max_page_perblog) <- c('replies','max_page')
+max_page_perblog #ยิ่งจำนวนตอบกลับเยอะยิ่งมีหลายหน้าย่อย
+```
+
+แบ่ง link ออกเป็น 2 ส่วนเพื่อสำหรับการเข้าถึงกระทู้ย่อย
+```{r}
+demo <- all_link[1:10,]
+demo$link
+```
+แบ่งเป็น 2 ส่วนคือ ด้านหน้า กับ ด้านหลัง
+```{r}
+demo$front <- str_extract(demo$link,".*(k[0-9]+)")
+demo$back <- sub("(k[0-9]+)","",demo$link) %>% str_extract(., "--.*") %>% sub('--',"",.)
+```
+ทดลอง Scrape
+
+ข้อมูลที่เลือกเก็บคือ
+1.Topic : ชื่อ กระทู้
+2.Comment : ความคิดเห็นของนักท่องเที่ยวในกระทู้นั้นๆ
+3.User : ชื่อ user ของนักท่องเที่ยว
+4.User_link : link profile ของ user นั้น
+5.User_loc : location ของ user
+6.From_mainlink : เอาไว้บอกว่ามาจาก main_link ไหน
+
+```{r}
+demo_sublink <-data.table()
+tryCatch({
+  for (i in (1:nrow(demo))) {
+    for (j in (1:max_page_perblog$max_page[i])){
+      if(j == 1 | j == 0){ #condition or 
+        url <-paste0("https://www.tripadvisor.com",demo$front[i],"-",demo$back[i])
+        topic <- read_html(url) %>% html_nodes(".postTitle") %>% html_text()
+        comment <-read_html(url)%>%html_nodes(".postBody")%>%html_text()
+        user <-read_html(url)%>%html_nodes(".username span")%>%html_text()
+        user_link <- read_html(url) %>% html_nodes(".username") %>% html_attrs() %>% unlist() %>% 
+          .[grepl('Profile',.)] %>% as.vector() %>% str_extract('/Profile/.*') %>% gsub("');","",.)
+        user_loc <- read_html(url)%>%html_nodes(".profile .location")%>%html_text()
+        post_date<-read_html(url)%>%html_nodes(".postDate")%>%html_text()
+        from_mainlink <- as.numeric(i)
+        #find useless pattern
+        del <- grep("-:- Message from Tripadvisor staff",comment)
+        if(length(del) == 0){
+          NA
+        }else{
+          topic <- topic[-del]
+          comment <- comment[-del]
+          user <- user[-del]
+          user_link <- user_link[-del]
+          user_loc <- user_loc[-del]
+          post_date <- post_date[-del]
+        }
+        all <-data.table(topic,comment,user,user_link,user_loc,post_date,from_mainlink)
+        Sys.sleep(1)
+      }else{
+        url <-paste0("https://www.tripadvisor.com",demo$front[i],"-o",page_dummy[j],"-",demo$back[i])
+        topic <- read_html(url) %>% html_nodes(".postTitle") %>% html_text()
+        comment <-read_html(url)%>%html_nodes(".postBody")%>%html_text()
+        user <-read_html(url)%>%html_nodes(".username span")%>%html_text()
+        user_link <- read_html(url) %>% html_nodes(".username") %>% html_attrs() %>% unlist() %>% 
+          .[grepl('Profile',.)] %>% as.vector() %>% str_extract('/Profile/.*') %>% gsub("');","",.)
+        user_loc <- read_html(url)%>%html_nodes(".profile .location")%>%html_text()
+        post_date<-read_html(url)%>%html_nodes(".postDate")%>%html_text()
+        from_mainlink <- as.numeric(i)
+        #find useless pattern
+        del <- grep("-:- Message from Tripadvisor staff",comment)
+        if(length(del) == 0){
+          NA
+        }else{
+          topic <- topic[-del]
+          comment <- comment[-del]
+          user <- user[-del]
+          user_link <- user_link[-del]
+          user_loc <- user_loc[-del]
+          post_date <- post_date[-del]
+        }
+        all <-data.table(topic,comment,user,user_link,user_loc,post_date,from_mainlink) 
+        Sys.sleep(1)
+      }
+      demo_sublink<-rbind(demo_sublink,all)
+      rm(all)
+      rm(del)
+    }
+  }
+},error = function(e){})
+
+```
+
+
+```{r}
+demo_sublink %>% as_tibble()
+```
+OK it's work
+
+ทำด้วย link ทั้งหมด
+```{r}
+all_link$front <- str_extract(all_link$link,".*(k[0-9]+)")
+all_link$back <- sub("(k[0-9]+)","",all_link$link) %>% str_extract(., "--.*") %>% sub('--',"",.)
+
+```
+
+ใช้ TryCatch เพื่อป้องกันไม่ให้ Loop หลุด
+```{r eval=FALSE}
+TripData <-data.table()
+tryCatch({
+  for (i in (1:nrow(all_link))) {
+  for (j in (1:max_page_perblog$max_page[i])){
+    if(j == 1 | j == 0){ #condition or 
+      url <-paste0("https://www.tripadvisor.com",all_link$front[i],"-",all_link$back[i])
+      topic <- read_html(url) %>% html_nodes(".postTitle") %>% html_text()
+      comment <-read_html(url)%>%html_nodes(".postBody")%>%html_text()
+      user <-read_html(url)%>%html_nodes(".username span")%>%html_text()
+      user_link <- read_html(url) %>% html_nodes(".username") %>% html_attrs() %>% unlist() %>% 
+        .[grepl('Profile',.)] %>% as.vector() %>% str_extract('/Profile/.*') %>% gsub("');","",.)
+      user_loc <- read_html(url)%>%html_nodes(".profile .location")%>%html_text()
+      post_date<-read_html(url)%>%html_nodes(".postDate")%>%html_text()
+      from_mainlink <- as.numeric(i)
+      #find useless pattern
+      del <- grep("-:- Message from Tripadvisor staff",comment)
+      if(length(del) == 0){
+        NA
+      }else{
+        topic <- topic[-del]
+        comment <- comment[-del]
+        user <- user[-del]
+        user_link <- user_link[-del]
+        user_loc <- user_loc[-del]
+        post_date <- post_date[-del]
+      }
+      all <-data.table(topic,comment,user,user_link,user_loc,post_date,from_mainlink)
+      Sys.sleep(1)
+    }else{
+      url <-paste0("https://www.tripadvisor.com",all_link$front[i],"-o",page_dummy[j],"-",all_link$back[i])
+      topic <- read_html(url) %>% html_nodes(".postTitle") %>% html_text()
+      comment <-read_html(url)%>%html_nodes(".postBody")%>%html_text()
+      user <-read_html(url)%>%html_nodes(".username span")%>%html_text()
+      user_link <- read_html(url) %>% html_nodes(".username") %>% html_attrs() %>% unlist() %>% 
+        .[grepl('Profile',.)] %>% as.vector() %>% str_extract('/Profile/.*') %>% gsub("');","",.)
+      user_loc <- read_html(url)%>%html_nodes(".profile .location")%>%html_text()
+      post_date<-read_html(url)%>%html_nodes(".postDate")%>%html_text()
+      from_mainlink <- as.numeric(i)
+      #find useless pattern
+      del <- grep("-:- Message from Tripadvisor staff",comment)
+      if(length(del) == 0){
+        NA
+      }else{
+        topic <- topic[-del]
+        comment <- comment[-del]
+        user <- user[-del]
+        user_link <- user_link[-del]
+        user_loc <- user_loc[-del]
+        post_date <- post_date[-del]
+      }
+      all <-data.table(topic,comment,user,user_link,user_loc,post_date,from_mainlink) 
+      Sys.sleep(1)
+    }
+    TripData<-rbind(TripData,all)
+    rm(all)
+    rm(del)
+    }
+    }
+  },error = function(e){}) 
+
+```
+ใช้เวลาทั้งหมดประมาณ 21 วัน
+
+```{r}
+#saveRDS(TripData,'TripData.rds')
+```
+
+```{r}
+TripData <- readRDS("/Users/fewsmc/TEST_git/tripAdvi_proj_FewPila/Scraping/TripData_part1.rds")
+TripData %>% as_tibble()
+```
